@@ -1,0 +1,19 @@
+#!/bin/sh
+
+#
+# Alpine
+#
+if [ -f /etc/alpine-release ]; then
+    apk update --no-cache
+    apk upgrade --no-cache
+    apk clean cache &>/dev/null
+#
+# Debian
+#
+elif [ -f /etc/debian_version ]; then
+    echo
+    apt update 
+    apt upgrade
+    apt clean cache
+fi
+

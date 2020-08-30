@@ -1,0 +1,689 @@
+#!/usr/bin/env bash
+
+# load configuration
+source /etc/lxm/lxm.conf
+
+# global variables
+SCRIPTS_DIR='/etc/lxm/scripts'
+PORTS_FWD_SCRIPT="${SCRIPTS_DIR}/ports-fwd"
+STATIC_IP_SCRIPT="${SCRIPTS_DIR}/static-ip"
+UPDATE_SCRIPT="${SCRIPTS_DIR}/update"
+TZ_SCRIPT="${SCRIPTS_DIR}/timezone"
+VERSION='1.0.5'
+
+#
+# FUNCTIONS
+#
+
+# helpers
+shout() { echo -e "$(basename "$0"): $*" >&2; }
+die() { shout "${*:2} ($1)"; exit "$1"; }
+try() { "$@" 2>/dev/null || die $? "cannot $*"; }
+hr() { printf '~%.0s' $(seq ${COLUMNS}); }
+
+get_arch(){
+    case "$(uname -m)" in
+        armv7l)  echo 'armhf';;
+        x86_64)  echo 'amd64';;
+        armv8)   echo 'arm64';;
+        i386)    echo 'i386';;
+        *)       echo 'amd64';;
+    esac
+}
+
+get_cpu_nb(){
+    lscpu -b -p=Core | grep -c '^[0-9]'
+}
+
+replace_or_add() {
+    local search="$1"
+    local replace="$2"
+    local file="$3"
+    if grep -q "${search}" "${file}"; then
+        sed -E "/${search//\//\\/}/s/.*/${replace}/" -i "${file}"
+    else
+        echo "${replace}" >> "${file}"
+    fi
+}
+
+lxm_check() {
+    ! lxc-ls | grep -qw "$1"
+}
+
+lxm_name_check() {
+    if [[ -z "$1" ]]; then
+        die 1 "Empty container name"
+    fi
+}
+
+lxm_name_exist() {
+    lxm_name_check "$1"
+    lxc-ls | grep -qw "$1"
+}
+
+lxm_name_required() {
+    lxm_name_check "$1"
+    if  lxm_check "$1"; then
+        die 1 "No container named '$1' exists"
+    fi
+}
+
+lxm_name_available() {
+    lxm_name_check "$1"
+    if lxm_name_exist "$1"; then
+        die 1 "Container '$1' already exist"
+    fi
+}
+
+lxm_name_running_check() {
+    lxm_name_check "$1"
+    lxc-ls --running | grep -qw "$1"
+}
+
+lxm_name_running_required() {
+    if  ! lxm_name_running_check "$1"; then
+        die 1 "The container '$1' is not running"
+    fi
+}
+
+lxm_container_path() {
+    echo "${CT_PATH}/$1"
+}
+
+lxm_config_path() {
+    echo "$(lxm_container_path "$1")/config"
+}
+
+lxm_config_get() {
+    local ct="$1"
+    local key="$2"
+    local config="$(lxm_config_path "${ct}")"
+    grep "^${key} = " "${config}"
+}
+
+lxm_config_set() {
+    local ct="$1"
+    local key="$2"
+    local value="${*:3}"
+    local config="$(lxm_config_path "${ct}")"
+    replace_or_add "^${key} = " "${key} = ${value}" "${config}"
+}
+
+lxm_config_cmt() {
+    echo "# ${*:2}" >> "$(lxm_config_path "$1")"
+}
+
+lxm_cores_map_get() {
+    grep -H cpuset "${CT_PATH}/"*'/config' | sed -e "s,${CT_PATH}/,," -e 's,/config.* = ,=,g'
+}
+
+lxm_cores_map() {
+    (( $# < 1 )) && return 1
+    local ctcores="$1"
+    local cores="$(( $(get_cpu_nb) - 1 ))"
+    local map="$(lxm_cores_map_get)"
+
+    # if all cores, set and exit
+    if [[ "${ctcores}" == 'all' ]]; then
+        seq -s',' 0 "${cores}" && return 0
+    fi
+
+    # get cores usage and sort : 3c1 2c2 [...]
+    for i in $(seq 0 "${cores}"); do
+        u[${i}]="$(echo "${map}" | grep -cw "${i}")c${i}"
+    done
+    IFS=$'\n' us=($(sort -n <<<"${u[*]}"))
+
+    # set less used cores
+    local i=0
+    local ctmap
+    while (( i < ctcores )); do
+        local core=$(echo "${us[${i}]}" | cut -d'c' -f2)
+        [[ -n ${ctmap} ]] && ctmap="${ctmap},${core}" || ctmap="${core}"
+        i=$((i+1))
+    done
+    echo "${ctmap}"
+}
+
+lxm_ip_set() {
+    local ct="$1"
+    local ip="$2"
+    if [[ -z "${ip}" ]]; then
+        return 1
+    fi
+    sed -e "s,<ip>,${ip},g" \
+        -e "s,<gateway>,${CT_GATEWAY},g" \
+        -e "s,<netmask>,${CT_NETMASK},g" \
+        -e "s,<dns>,${CT_DNS},g" \
+        -e "s,<domain>,${CT_DOMAIN},g" \
+        "${STATIC_IP_SCRIPT}" > /tmp/set-ip
+    lxm_execfile "${ct}" /tmp/set-ip
+    rm -f /tmp/set-ip
+    replace_or_add " ${ct}.lxc" "${ip} ${ct}.lxc" "${CT_HOSTS}"
+}
+
+lxm_tz_set() {
+    local ct="$1"
+    lxm_execfile "${ct}" "${TZ_SCRIPT}"
+}
+
+lxm_fw_cmd(){
+    if ! command -v fw &>/dev/null; then
+        return 1
+    fi
+    fw "$@" &>/dev/null
+}
+
+lxm_fw_unset(){
+    lxm_fw_cmd del "$1"
+}
+
+lxm_fw_set(){
+    local ct="$1"
+    local in="$2"
+    local out="$3"
+    [[ "$4" != '-q' ]] && echo "Firewall ${ct}..."
+    lxm_fw_cmd del "${ct}"
+    lxm_fw_cmd add "${ct}" ${in:+ -i "${in}"} ${out:+ -o "${out}"} "${@:4}"
+}
+
+lxm_build_bare() {
+    local ct="$1"
+    mkdir -p "./${ct}/data" "./${ct}/scripts"
+    cat <<EOF > "./${ct}/ct.conf"
+# Container
+hostname: ${ct}
+os: alpine
+release: 3.12
+# Ressources
+disk: 64M
+cpu.cores: 1
+cpu.time: 10%
+memory: 64M
+# Network
+ip: $(echo "${CT_GATEWAY}" | cut -d'.' -f1-3).10
+fw.in: 123/tcp,456/udp
+fw.out: all
+fw.log: false
+# Shared disks
+mp.0: ./data:/data
+# Boot
+start.auto: 1
+start.order: 1
+start.delay: 10
+# Building script
+ks.0: ./scripts/install.sh
+EOF
+    cat <<EOF > "./${ct}/scripts/install.sh"
+#!/bin/sh
+# Container install script
+EOF
+    cat <<EOF > "./${ct}/data/readme"
+File shared with container
+EOF
+    [[ -n "${SUDO_USER}" ]] && chown "${SUDO_USER}:" -R "./${ct}"
+    echo "Container '${ct}' data structure created"
+}
+
+#
+# COMMANDS
+#
+
+# ht: init     NAME --bare          init a build data structure directories and files
+# ht: init     NAME [OPTS]          create a named container using the download template
+lxm_init() {
+    local ct="$1"
+    lxm_name_available "${ct}"
+    if [[ "$2" == '--bare' ]]; then
+        lxm_build_bare "${ct}"
+    else
+        lxc-create -t download -n "${ct}" -- -a "$(get_arch)" "${@:2}"
+    fi
+}
+
+# ht: build    CONFIG [-f]          create container from configuration file
+# hd: build use -f to delete old container first
+# hd: build use init NAME --bare command to create an empty data structure
+lxm_build() {
+    local conf="$1"
+    get_lxc_opts()  { grep '^lxc.* = ' "${conf}"; }
+    get_attr() { grep "^$1:" "${conf}" | sed -e "s,$1: *,," -e 's, *#.*,,'; }
+    get_list() { grep -oE "^$1\.[0-9]+" "${conf}"; }
+    ge(){ echo "$1" | cut -d':' -f"$2"; }
+
+    # delete old container
+    local ct="$(get_attr hostname)"
+    lxm_name_check "${ct}"
+    if [[ "$2" == '-f' ]] && lxm_name_exist "${ct}"; then
+        lxm_rm "${ct}" -y
+    fi
+
+    # create container
+    # + use lvm if enabled
+    echo "Build ${ct}..."
+    ${LVM_DISK} && lvm_opts="--bdev lvm --vgname ${LVM_VG} --thinpool ${LVM_POOL} --fstype ext4 --fssize $(get_attr disk)"
+    lxc-create -n "${ct}" -t download ${lvm_opts} -- -d "$(get_attr os)" -r "$(get_attr release)" -a "$(get_arch)" &>./build.log
+    if [[ "$?" == '1' ]]; then
+        die 1 'failed, container already exist ? read build.log for more info.'
+    else
+        rm build.log
+    fi
+
+    # port forwarding for lxcbr0
+    echo "Prepare ${ct}..."
+    if [[ "${INTERFACE}" == 'lxcbr0' && -n "$(get_attr ports)" ]]; then
+        lxm_config set "${ct}" net-up-script   "${PORTS_FWD_SCRIPT}" "$(get_attr ports)"
+        lxm_config set "${ct}" net-down-script "${PORTS_FWD_SCRIPT}"
+    fi
+    # mac address config
+    local mac="${CT_MAC_BASE}$(hexdump -n3 -e '/1 ":%02X"' /dev/urandom)"
+    lxm_config set "${ct}" mac-addr     "${mac}"
+
+    # specific lxc.* config
+    local lxm_opts="$(get_lxc_opts)"
+    if [[ -n "${lxm_opts}" ]]; then
+        lxm_config_cmt "${ct}" 'Misc. configuration'
+        echo "${lxm_opts}" >> "$(lxm_config_path "${ct}")"
+    fi
+
+    # system configuration
+    lxm_config_cmt "${ct}" 'Resources configuration'
+    lxm_config set "${ct}" memory       "$(get_attr memory)"
+    lxm_config set "${ct}" cpu          "$(lxm_cores_map "$(get_attr cpu.cores)")"
+    lxm_config set "${ct}" cpu-share    "$(get_attr cpu.time)"
+    lxm_config_cmt "${ct}" 'Boot configuration'
+    lxm_config set "${ct}" start-auto   "$(get_attr start.auto)"
+    lxm_config set "${ct}" start-delay  "$(get_attr start.delay)"
+    lxm_config set "${ct}" start-order  "$(get_attr start.order)"
+    lxm_config_cmt "${ct}" 'Disk configuration'
+    for i in $(get_list 'mp'); do
+        local mp="$(get_attr "${i}")"
+        lxm_share "${ct}" "$(ge "${mp}" 1)" "$(ge "${mp}" 2)" "$(ge "${mp}" 3)" &>/dev/null
+    done
+
+    # start container, set ip and open fw
+    lxm_start "${ct}"
+    echo "Configure ${ct}..."
+    lxm_ip_set "${ct}" "$(get_attr ip)" &>/dev/null
+    if ${FW} && [[ "${INTERFACE}" != 'lxcbr0' ]]; then
+        lxm_fw_set "${ct}" 'all' 'all' -q
+    fi
+    lxm_tz_set "${ct}" &>/dev/null
+
+    # run installation scripts
+    echo "Install ${ct}..."; hr
+    for id in $(get_list '(cp|ks)'); do
+        local at="$(get_attr "${id}")"
+        [[ ${id} =~ 'cp' ]] && lxm_push "${ct}" "$(ge "${at}" 1)" "$(ge "${at}" 2)"
+        [[ ${id} =~ 'ks' ]] && lxm_execfile "${ct}" "${at}"
+    done; hr
+
+    # set firewall rules
+    if ${FW} && [[ "${INTERFACE}" != 'lxcbr0' ]]; then
+        [[ "$(get_attr fw.log)" == 'true' ]] && local fwopts='-l'
+        lxm_fw_set "${ct}" "$(get_attr fw.in)" "$(get_attr fw.out)" "${fwopts}"
+    fi
+}
+
+# ht: rm       NAME [-y] [-f]       delete the named container
+# hd: rm use -y to not ask for validation
+# hd: rm use -f to force cleanup of container files
+lxm_rm() {
+    local ct="$1"
+    local cleanup=false
+    local delete=false
+    while [[ -n "$1" ]]; do
+        case "$1" in
+            -y) delete=true;;
+            -f) cleanup=true;;
+        esac
+        shift
+    done
+    # Ask for validation
+    if ! ${delete}; then
+        read -rp "Continue? [y/N]: "
+        [[ "${REPLY}" =~ ^[Yy]$ ]] || exit 0
+    fi
+    # Delete container
+    echo "Destroy ${ct}..."
+    lxc-destroy -n "${ct}" -f &>/dev/null
+    ${FW} && lxm_fw_unset "${ct}"
+    sed "/ ${ct}.lxc/d" -i "${CT_HOSTS}"
+    # Clean orphan files
+    if ${cleanup}; then
+        echo "Cleanup ${ct}..."
+        rm -r "$(lxm_container_path "${ct}")" &>/dev/null
+        if ${LVM_DISK}; then
+            lvremove -f -y "${LVM_VG}/${ct}" &>/dev/null
+        fi
+    fi
+}
+
+# ht: start    NAME [NAME...]       start the named container(s)
+lxm_start() {
+    local containers=''
+    if [[ "$1" == 'all' ]]; then
+        containers="$(lxc-ls --stopped)"
+    else
+        containers="${*:1}"
+    fi
+    for ct in $containers; do
+        lxm_name_required "${ct}"
+        if ! lxc-wait -n "${ct}" -s RUNNING -t 0; then
+            echo "Start ${ct}..."
+            lxc-start -n "${ct}" -d
+            lxc-wait -n "${ct}" -s RUNNING
+        fi
+    done
+}
+
+# ht: stop     NAME [NAME...]       stop the named container(s)
+# hd: stop if you run the command "stop all", it will stop all running containers
+lxm_stop() {
+    local containers=''
+    if [[ "$1" == 'all' ]]; then
+        containers="$(lxc-ls --running)"
+    else
+        containers="${*:1}"
+    fi
+    for ct in $containers; do
+    	lxm_name_required "${ct}"
+    	echo "Stop ${ct}..."
+    	lxc-stop -n "${ct}" -t 10
+    done
+}
+
+# ht: restart  NAME [NAME...]       stop & start the named container(s)
+lxm_restart() {
+    local containers=''
+    if [[ "$1" == 'all' ]]; then
+        containers="$(lxc-ls)"
+    else
+        containers="${*:1}"
+    fi
+    for ct in $containers; do
+        lxm_stop "${ct}"
+        lxm_start "${ct}"
+    done
+}
+
+# ht: update   NAME [NAME...]       update the named running container(s)
+# hd: update warning: reset firewall data counter
+lxm_update() {
+    local containers=''
+    if [[ "$1" == 'all' ]]; then
+        containers="$(lxc-ls --running)"
+    else
+        containers="${*:1}"
+    fi
+    ${FW} && lxm_fw_cmd save
+    ${FW} && lxm_fw_cmd reset
+    for ct in $containers; do
+        lxm_name_required "${ct}"
+        echo "Update ${ct}..."
+        hr && lxm_execfile "${ct}" "${UPDATE_SCRIPT}" && hr
+    done
+    ${FW} && lxm_fw_cmd restore
+}
+
+# ht: backup   NAME PATH            backup the named container
+# hd: backup work only with 'dir' backing store
+lxm_backup() {
+    if ${LVM_DISK}; then
+        die '1' 'Backup of container with lvm backend not supported yet'
+    fi
+    local ct="$1"
+    local backup="$(realpath "$2")"
+    lxm_name_running_check "${ct}"     && die '1' "Container ${ct} must be stopped"
+    cd "$(lxm_container_path "${ct}")" || die '1' "Missing ${ct} filesysyem"
+    echo "Backup ${ct}..."
+    tar --numeric-owner -czf "${backup}" .
+}
+
+# ht: restore  BACKUP NAME          restore the named container
+# hd: restore work only with 'dir' backing store
+lxm_restore() {
+    if ${LVM_DISK}; then
+        die '1' 'Restore of container with lvm backend not supported yet'
+    fi
+    local backup="$(realpath "$1")"
+    local ct="$2"
+    mkdir "$(lxm_container_path)/${ct}" || die '1' "Container ${ct} already exist"
+    cd "$(lxm_container_path)/${ct}"    || die '1' "Unable to restore ${backup}"
+    echo "Restore ${backup}..."
+    tar --numeric-owner -xzf "${backup}" .
+}
+
+# ht: clone    NAME [CLONE]         clone the named container [to clone]
+lxm_clone() {
+    local ct="$1"
+    local cc="${2:-"${ct}.clone"}"
+    local ct_path="$(lxm_container_path)/${ct}"
+    local cc_path="$(lxm_container_path)/${cc}"
+    if lxm_name_running_check "${ct}"; then
+        die '1' "Container ${ct} must be stopped"
+    elif lxm_name_exist "${cc}" ; then
+        die '1' "Container ${cc} already exists"
+    fi
+    echo "Clone ${ct} to ${cc}..."
+    cp -a "${ct_path}" "${cc_path}"
+    sed -i "s,${ct},${cc},g" "${cc_path}/config"
+    if ${LVM_DISK}; then
+        lvsize="$(sudo lvs --noheadings -o lv_size "${LVM_VG}/${ct}" | sed 's/ *//g')"
+        lvcreate -V"${lvsize}" --thin -n "${cc}" "${LVM_VG}/${LVM_POOL}" >/dev/null
+        if [[ "$?" == '0' ]]; then
+            dd if="/dev/${LVM_VG}/${ct}" of="/dev/${LVM_VG}/${cc}" bs=4M 2>/dev/null
+        fi
+    fi
+}
+
+# ht: attach   NAME                 attach the named container using bash as a default shell
+lxm_attach() {
+    lxm_name_required "$1"
+    [[ "$2" != '-q' ]] && echo "Attach to $1..."
+    cd ~ && SHELL=/bin/bash LANG=C lxc-attach -n "$1"
+}
+
+# ht: go       NAME                 start if not ready, and attach to the named container
+lxm_go() {
+    lxm_start "$1" && lxm_attach "${@}"
+}
+
+# ht: exec     NAME COMMAND         run a command on the named running container
+lxm_exec() {
+    lxm_name_running_required "$1"
+    [[ -z "${*:2}" ]] && die 1 "The 'command' argument is mandatory"
+    lxc-attach -n "$1" -- "${@:2}"
+}
+
+# ht: execfile NAME FILE            run a script on the named running container (with sh)
+lxm_execfile() {
+    local ct="$1"
+    local script="$2"
+    local bin="/tmp/$(basename "${script}")"
+    echo "+ $(basename "${script}")"
+    lxm_push "${ct}" "${script}" /tmp/ &> /dev/null
+    lxm_exec "${ct}" sh -c "chmod u+x ${bin}; ${bin}; rm -f ${bin}"
+}
+
+# ht: ls       [PATTERN]            list of available containers [matching pattern]
+lxm_ls() {
+    local red="$(echo -e '\e[1;31m')"
+    local green="$(echo -e '\e[1;32m')"
+    local reset="$(echo -e '\e[0m')"
+    lxc-ls -fF NAME,STATE,IPV4 "$@" \
+      | sed -u -e "s/RUNNING/${green}\0${reset}/g" \
+               -e "s/STOPPED/${red}\0${reset}/g"
+}
+
+# ht: lsi      [PATTERN]            list of available images [matching pattern]
+lxm_lsi() {
+    local find="${1}"
+    echo 'List images...'
+    /usr/share/lxc/templates/lxc-download -l -a "$(get_arch)" | tail -n+7 | sed '$d' \
+      | awk '{print $1"-"$2"-"$3}' | grep "${find}" | column
+}
+
+# ht: cpumap   [PATTERN]            list of used cores [matchin pattern]
+lxm_cpumap(){
+    local cores="$(get_cpu_nb)"
+    local v=" |c$(seq -s'|c' 1 "${cores}")|\n" # header
+    local ct
+    # for all container
+    while read -r line; do
+        ct="$(echo "${line}" | cut -d'=' -f1)"
+        v="${v}${ct}"
+        # foreach cores
+        for i in $(seq 0 "$((cores-1))"); do
+            if echo "${line}" | grep -qw "${i}"; then
+                v="${v}|x"
+            else
+                v="${v}| "
+            fi
+        done
+        v="${v}\n"
+    done < <(lxm_cores_map_get | grep "$1") # list of ct + cores
+    echo -e "${v}" | column -ts '|'
+}
+
+
+# ht: info     NAME                 give information about the named container
+lxm_info() {
+    lxm_name_required "$1"
+    lxc-info --name "$1"
+}
+
+# ht: top      [NAME]               give top information about [named] container
+lxm_top() {
+    systemd-cgtop -p --depth 1 "/lxc/$1"
+}
+
+# ht: push     NAME SRC [DST]       copy the source file to the target path in the named container
+# hd: push target path are relative to the `rootfs`. if `target` is omitted, the file will be pushed at the "/" of the container
+lxm_push() {
+    lxm_name_required "$1"
+    local src="$(readlink -f "$2")"
+    local src_path="$(dirname "$src")"
+    local src_file="$(basename "$src")"
+    local dst_dir="$3"
+    #cp -r $source_file $(lxm_container_path $1)/rootfs/$dst_dir  # not working with LVM
+    tar --owner=0 --group=0 -C "${src_path}" -c "${src_file}" \
+     | lxc-attach -n "$1" -- /bin/sh -c "tar -C ${dst_dir} -x"
+    echo "${src_file} copied into $1:${dst_dir}"
+}
+
+# ht: share    NAME SRC MNT [ro|rw] mount a shared directory on the named container
+# hd: share SRC = local source path
+# hd: share MNT = lxc target path
+# hd: share optional: add mount permissions (ro, rw, ...)
+lxm_share() {
+    lxm_name_required "$1"
+    local config="$(lxm_config_path "$1")"
+    local source_path="$(readlink -f "$2")"
+    local target_path="${3#/}"
+    local options="${*:4}"
+    local perm
+    if  [[ -z "${source_path}" ]]; then
+        die 1 "'local source path' argument is mandatory"
+    elif [[ -z "${target_path}" ]]; then
+        die 1 "'lxc target path' argument is mandatory"
+    fi
+    [[ "${options}" =~ ^r(o|w)$ ]] && perm="${options}," && options=
+    options="${options:-none ${perm}defaults,bind,uid=0,create=dir 0 0}"
+    source_prefix="lxc.mount.entry = ${source_path}"
+    line="${source_prefix} ${target_path} ${options}"
+    # Delete the previous share (if exist) + add it
+    sed -i "\|${source_prefix} |d" "${config}"
+    echo "${line}" >> "${config}"
+    echo "Shared '${source_path}'"
+}
+
+# ht: unshare  NAME SRC             unmount the shared directory on the named container
+lxm_unshare() {
+    lxm_name_required "$1"
+    local config=$(lxm_config_path "$1")
+    local source_path="$(readlink -f "$2")"
+    local options=${*:3}
+    local source_prefix="lxc.mount.entry = ${source_path}"
+    if [[ -z "${source_path}" ]]; then
+        die 1 "'local source path' argument is mandatory"
+    fi
+    # Delete the previous share
+    sed -i "\|${source_prefix} |d" "${config}"
+    echo "Unshared '${source_path}'"
+}
+# ht: config   edit|set|get NAME    modify configuration of the named container
+# hd: config   show NAME            show the configuration of container
+# hd: config   edit NAME            modify interactively the configuration of container
+# hd: config   get  NAME KEY        get the value of the key for the container
+# hd: config   set  NAME KEY VAL    set the value of the key for the container
+# hd: config
+# hd: config   KEY = cpu|cpu-share|memory|start-auto|start-delay|start-order|net-up-script|net-down-script
+lxm_config() {
+    local action="$1"
+    local ct="$2"
+    local key="$3"
+    local value="${*:4}"
+    lxm_name_required "${ct}"
+    if [[ "${action}" == 'show' ]]; then
+        grep -v '^ *$' "$(lxm_config_path "${ct}")"
+	exit $?
+    elif [[ "${action}" == 'edit' ]]; then
+        ${EDITOR:-vim} "$(lxm_config_path "${ct}")"
+	exit $?
+    elif [[ "${action}" == 'set' ]] && [[ -z "${value}" ]]; then
+	return 1
+    fi
+    case "${key}" in
+       cpu)         	key=lxc.cgroup.cpuset.cpus;;
+       cpu-share)   	key=lxc.cgroup.cpu.shares; value=${value/\%/};;
+       memory)      	key=lxc.cgroup.memory.limit_in_bytes;;
+       start-auto)  	key=lxc.start.auto;;
+       start-delay) 	key=lxc.start.delay;;
+       start-order) 	key=lxc.start.order; [[ "${action}" == 'set' ]] && value=$((100-value));;
+       net-up-script)	key=lxc.net.0.script.up;;
+       net-down-script) key=lxc.net.0.script.down;;
+       mac-addr)        key=lxc.net.0.hwaddr;;
+       lxc.*)       	:;;
+       *)           	echo "Key '${key}' unknown, exit."; exit 1;;
+    esac
+    case "${action}" in
+        get)  lxm_config_get "${ct}" "${key}";;
+        set)  lxm_config_set "${ct}" "${key}" "${value}";;
+    esac
+}
+
+# ht: help     [COMMAND]            displays help message [for the designated command]
+lxm_help() {
+    if [[ -z "$1" ]]; then
+        echo "Available COMMANDS:"
+        echo && sed -n '/^# ht: /{s/# ht: /  /;p}' "$0"
+    else
+        cmd="$1"
+        echo "Help on: ${cmd}"
+        echo && sed -n "/^# ht: ${cmd}/{s/# ht: /  /;p}" "$0"
+        echo && sed -n "/^# hd: ${cmd}/{s/# hd: ${cmd}/ /;p}" "$0"
+    fi
+    echo
+}
+
+# ht: version                       show version
+lxm_version() {
+    local LXC_VERSION="$(lxc-ls --version 2>/dev/null)"
+    echo "lxm ${VERSION}, lxc ${LXC_VERSION:-"not installed!"}"
+    echo "The MIT License: <https://mit-license.org>"
+    echo "Written by Baptiste DE RENZO"
+}
+
+# Root ?
+if [[ "${EUID}" != '0' ]]; then
+    die '1' "need root rights"
+fi
+
+# Main
+case "$1" in
+    help|start|stop|restart|clone|attach|ls|lsi|cpumap|info|top|config|init|\
+       build|backup|restore|rm|go|push|share|unshare|exec|execfile|update|version) "lxm_$1" "${@:2}";;
+    *) shout "invalid command '$1'"; echo "Try 'lxm help' for more information."; exit 1;;
+esac
+

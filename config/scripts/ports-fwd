@@ -1,0 +1,52 @@
+#!/bin/sh
+#
+#lxc.net.0.script.up = /opt/lxc-ports.sh tcp/8080:80 tcp/2222:22
+#lxc.net.0.script.down = /opt/lxc-ports.sh
+# args => 'tcp/8080:80' 'tcp/2222:22' 'container' 'net' 'up' 'veth' 'lxcbr0' 'vethVCDYN6' --
+#
+
+# vars
+dhcpfile="/etc/lxc/dhcp.conf"
+logfile="${0%.sh}.log"
+
+# args
+while [ "$#" -gt 6 ] ; do
+    ports="$ports $1"
+    shift
+done
+container="$1"
+action="$3"
+
+# get info
+containerip="$(grep -w "$container" "$dhcpfile" | cut -d',' -f2)"
+interface="$(ls /sys/class/net/ | grep -vE 'lo|lxcbr|veth')"
+
+# log functions
+stamp(){ LC_ALL=en_EN.utf8 date '+%b %d %T'; }
+log(){ echo "$(stamp) ${USER} $$:$*" >> $logfile; }
+
+# add rules
+for item in $ports ; do
+        item=${item#tcp/}
+        proto=tcp
+        if [ "${item#udp/}" != "$item" ]; then
+        	item=${item#udp/}
+                proto=udp
+        fi
+        hostport=${item%:*}
+        containerport=${item#*:}
+        if [ "$action" = "up" ] ; then
+		log "INFO $container: add forward rules for $proto from host:$hostport to $container:$containerport"
+		iptables -t nat -A PREROUTING -p "$proto" -i "$interface" --dport "$hostport" -j DNAT --to-destination "$containerip:$containerport"
+		#nft add rule ip nat PREROUTING iifname $interface tcp dport "$hostport" counter dnat to "$containerip:$containerport"
+        fi
+done
+
+# delete rules
+if [ "$action" = 'down' ]; then
+	log "INFO $container: delete all forward rules"
+	iptables -t nat -L PREROUTING --line-numbers | grep -w $containerip | cut -d' ' -f1 | xargs -rI{} iptables -t nat -D PREROUTING {}
+	#nft list chain nat PREROUTING -a | grep -w $containerip | grep -o 'handle.*' | while read -r id; do
+	#        nft delete rule nat PREROUTING $id
+	#done
+fi

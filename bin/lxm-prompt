@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+
+_lxm_commands(){
+    local cur prev opts
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    opts="start stop restart update attach clone ls lsi cpumap info top config init"
+    opts="${opts} build rm go push share unshare exec execfile backup restore help version"
+    COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+}
+
+
+_lxm_arguments() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+    _root(){
+        if [[ "${EUID}" != '0' ]]; then
+            local sudo='/usr/bin/sudo'
+            [[ -f "${sudo}" ]] && sudo "$@"
+        else
+            "$@"
+        fi
+    }
+    case "${prev}" in
+        ls|init|help|version)
+            # No completion, this command has no argument
+            return 0
+            ;;
+        start)
+            # List stopped containers + all
+            opts="$(_root lxc-ls --stopped) all"
+            COMPREPLY=( $(compgen -W '${opts}' "${cur}") )
+            return 0
+            ;;
+        clone)
+            # List stopped containers
+            opts="$(_root lxc-ls --stopped)"
+            COMPREPLY=( $(compgen -W '${opts}' "${cur}") )
+            return 0
+            ;;
+        restart|stop)
+            # List running containers + all
+            opts="$(_root lxc-ls --running) all"
+            COMPREPLY=( $(compgen -W '${opts}' "${cur}") )
+            return 0
+            ;;
+        attach|exec|execfile|update|top)
+            # List only running containers
+            opts="$(_root lxc-ls --running)"
+            COMPREPLY=( $(compgen -W '${opts}' "${cur}") )
+            return 0
+            ;;
+	info|rm|go|push|backup|share|unshare|cpumap|get|set|edit)
+            # All containers list
+            opts="$(_root lxc-ls)"
+            COMPREPLY=( $(compgen -W '${opts}' "${cur}") )
+            return 0
+            ;;
+        config)
+            opts='get set edit show'
+            COMPREPLY=( $(compgen -W '${opts}' "${cur}") )
+            return 0
+            ;;
+        lxm)
+            _lxm_commands
+            ;;
+    esac
+}
+
+complete -o default -F _lxm_arguments lxm
+

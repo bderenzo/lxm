@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+
+_fw_commands(){
+    local cur prev opts
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    opts="add del init reset show test save restore zero"
+    COMPREPLY=( $(compgen -W "${opts}" -- ${cur}) )
+}
+
+_fw_arguments() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+    _root(){
+        if [[ "${EUID}" != '0' ]]; then
+            local sudo='/usr/bin/sudo'
+            [[ -f "${sudo}" ]] && sudo "$@"
+        else
+            "$@"
+        fi
+    }
+    case "$prev" in
+        add|del|show)
+            # List all containers
+            COMPREPLY=( $(compgen -W "$(_root lxc-ls)" -- ${cur}) )
+            return 0
+            ;;
+        zero)
+            # List all containers
+            COMPREPLY=( $(compgen -W "$(_root iptables -L 2>/dev/null | awk '/^Chain/{print $2}')" -- ${cur}) )
+            return 0
+            ;;
+        fw)
+            _fw_commands
+            ;;
+    esac
+}
+complete -o default -F _fw_arguments fw

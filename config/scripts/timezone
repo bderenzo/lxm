@@ -1,0 +1,22 @@
+#!/bin/sh
+
+# timezone
+TZ='Europe/Paris'
+
+#
+# Alpine
+#
+if [ -f /etc/alpine-release ]; then
+    apk add --no-cache tzdata
+    cp /usr/share/zoneinfo/"${TZ}" /etc/localtime
+    echo "${TZ}" > /etc/timezone
+    apk del --no-cache tzdata
+    apk clean cache
+#
+# Debian
+#
+elif [ -f /etc/debian_version ]; then
+    echo
+    timedatectl set-timezone "${TZ}"
+fi
+

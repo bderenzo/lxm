@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+
+# global variables
+LOCAL_BIN_DIR=/usr/local/bin
+LXM_CONFIG_DIR=/etc/lxm
+
+# load functions
+shout() { echo "$0: $*" >&2; }
+die() { shout "${*:2}" "($1)"; exit "$1"; }
+
+# test root
+if [[ "${EUID}" != '0' ]]; then
+    die '1' "need root rights"
+fi
+
+# go to this dit
+cd "$(dirname "$(readlink -f "$0")")" || die 1 'unable to change directory...'
+
+# parse arguments
+uninstall=false
+while [[ -n "$1" ]]; do
+    case "$1" in
+        -r|--remove)    uninstall=true;;
+    esac
+    shift
+done
+
+if ! ${uninstall}; then
+    echo 'Install...'
+    install -m 755 -o root -d "${LXM_CONFIG_DIR}/scripts/"
+    install -m 755 -o root -d "${LXM_CONFIG_DIR}/"
+    install -m 755 -o root bin/lxm "${LOCAL_BIN_DIR}/"
+    install -m 755 -o root bin/fw  "${LOCAL_BIN_DIR}/"
+    install -m 644 -o root config/lxm.conf "${LXM_CONFIG_DIR}"
+    install -m 644 -o root config/scripts/static-ip "${LXM_CONFIG_DIR}/scripts/"
+    install -m 644 -o root config/scripts/ports-fwd "${LXM_CONFIG_DIR}/scripts/"
+    install -m 644 -o root config/scripts/timezone  "${LXM_CONFIG_DIR}/scripts/"
+    install -m 644 -o root config/scripts/update    "${LXM_CONFIG_DIR}/scripts/"
+    if [ -d '/etc/bash_completion.d/' ]; then
+        install -m 644 -o root bin/lxm-prompt /etc/bash_completion.d/
+        install -m 644 -o root bin/fw-prompt  /etc/bash_completion.d/
+    fi
+else
+    echo 'Remove...'
+    rm "${LOCAL_BIN_DIR}/lxm"
+    rm "${LOCAL_BIN_DIR}/fw"
+    rm "${LXM_CONFIG_DIR}/lxm.conf"
+    rm "${LXM_CONFIG_DIR}/scripts/static-ip"
+    rm "${LXM_CONFIG_DIR}/scripts/ports-fwd"
+    rm "${LXM_CONFIG_DIR}/scripts/timezone"
+    rm "${LXM_CONFIG_DIR}/scripts/update"
+    rmdir "${LXM_CONFIG_DIR}/scripts"
+    rmdir "${LXM_CONFIG_DIR}"
+    if [ -d '/etc/bash_completion.d/' ]; then
+        rm /etc/bash_completion.d/lxm-prompt
+        rm /etc/bash_completion.d/fw-prompt
+    fi
+fi
+echo "Done."
+

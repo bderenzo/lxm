@@ -1,0 +1,54 @@
+#!/bin/sh
+
+#
+# Alpine
+#
+if [ -f /etc/alpine-release ]; then
+    cat << EOF > /etc/network/interfaces
+auto lo
+iface lo inet loopback
+iface lo inet6 loopback
+
+auto eth0
+iface eth0 inet static
+	address <ip>
+	netmask <netmask>
+	gateway <gateway>
+	hostname \$(hostname)
+EOF
+    cat << EOF > /etc/resolv.conf
+search <domain>
+nameserver <dns>
+EOF
+    /etc/init.d/networking restart
+
+#
+# Debian
+#
+elif [ -f /etc/debian_version ]; then
+    cat << EOF > /etc/network/interfaces
+# This file describes the network interfaces available on your system
+# and how to activate them. For more information, see interfaces(5).
+
+source /etc/network/interfaces.d/*
+
+# The loopback network interface
+auto lo
+iface lo inet loopback
+iface lo inet6 loopback
+
+#iface eth0 inet dhcp
+auto eth0
+iface eth0 inet static
+        address <ip>
+        netmask <netmask>
+        gateway <gateway>
+EOF
+    cat << EOF > /etc/resolv.conf
+domain <domain>
+search <domain>
+nameserver <dns>
+EOF
+    systemctl restart networking
+fi
+

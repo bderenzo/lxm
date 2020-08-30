@@ -1,0 +1,238 @@
+#!/bin/bash
+
+# load configuration
+source /etc/lxm/lxm.conf
+DOMAIN='lxc'
+
+# utilities
+shout(){ echo "$0: $*" >&2; }
+die(){ shout "${*:2}" "($1)"; exit "$1"; }
+try(){ "$@" 2>/dev/null || die $? "cannot $*"; }
+list(){ echo "$@" | tr ',' ' '; }
+
+# convert iptables cmd with tcp or udp & src or dst ports
+iptables_ports(){
+    local p=1
+    for arg in "${@}"; do
+        p=$((p+1))
+        [[ "${arg}" == '--ports' ]] && break
+    done
+
+    local ports=${@:$p:1}
+    [[ "${ports}" =~ ^- ]] && return 0 # no port
+    for port in $(list "${ports}"); do
+        local cmd='--dport'
+        local protos='tcp udp'
+
+        # src or dst port
+        if [[ ${port} =~ ^s ]]; then
+            port="${port#s}" && cmd='--sport'
+        elif [[ $port =~ ^d ]]; then
+            port="${port#d}" && cmd='--dport'
+        fi
+
+        # tcp or udp port
+        if [[ "${port}" =~ /tcp$ ]]; then
+            port="${port%/tcp}" && protos='tcp'
+        elif [[ $port =~ /udp$ ]]; then
+            port="${port%/udp}" && protos='udp'
+        fi
+
+        for proto in $protos; do
+            iptables "${@:1:$((p-2))}" -p "${proto}" "${cmd}" "${port}" "${@:$((p+1))}"
+        done
+    done
+}
+
+# ht: init                          initialize ruleset
+fw_init(){
+    # Add rules to list
+    echo "fw init" >> "${FW_RULES_LIST}"
+    echo "Add default rules..."
+
+    # Established connections chains
+    iptables -N established
+    for proto in tcp udp icmp; do
+        iptables -A established -p "${proto}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    done
+
+    # Host connections chain
+    iptables -N host-input
+    iptables -N host-output
+    iptables_ports -A host-input  --ports "${FW_HOST_INPUT_PORTS}"  -j ACCEPT
+    iptables_ports -A host-output --ports "${FW_HOST_OUTPUT_PORTS}" -j ACCEPT
+
+    # Container connections chains
+    for chain in ct-{input,output} specific; do
+        iptables -N "${chain}"
+    done
+
+    # Drop invalid packets
+    iptables -A INPUT -m conntrack --ctstate INVALID -j DROP
+
+    # Standard rules
+    iptables -A INPUT   -i lo   -j ACCEPT # loopback
+    iptables -A FORWARD -i lo   -j ACCEPT
+    iptables -A INPUT   -p icmp -j ACCEPT # icmp
+    iptables -A FORWARD -p icmp -j ACCEPT
+
+    # Accept incoming/outgoing packets for established connections
+    for chain in INPUT FORWARD OUTPUT; do
+        iptables -A "${chain}" -m conntrack --ctstate ESTABLISHED,RELATED -j established
+    done
+
+    # Container redirect rules
+    iptables -A INPUT -i "${INTERFACE}" -m state --state NEW -j host-input
+    iptables -A OUTPUT                  -m state --state NEW -j host-output
+    for chain in ct-{input,output} specific; do
+        iptables -A FORWARD -i "${INTERFACE}" -m state --state NEW -j "${chain}"
+    done
+
+    # Drop everything else
+    iptables -P INPUT   DROP
+    iptables -P FORWARD DROP
+}
+
+# ht: add     NAME -i XX -o YY      add input or/and output rules for host
+fw_add(){
+    # save rules
+    rules="fw add $*"
+
+    local log=false
+    local input_policy=DROP
+    local output_policy=DROP
+    local ct="$1"; shift;
+    local ctd="${ct}.${DOMAIN}"
+    while [[ "$1" =~ ^- && ! "$1" == "--" ]]; do
+        case "$1" in
+            -i|--input)      shift; local input_ports="$1";;
+            -o|--output)     shift; local output_ports="$1";;
+            -l|--log)        log=true;;
+        esac
+        shift
+    done
+    [[ "$1" == '--' ]] && shift
+
+    # Verify host
+    if ! grep -q " *${ctd}$" /etc/hosts; then
+        die 1 "Host ${ctd} missing in /etc/hosts"
+    fi
+
+    # Add rules
+    echo "Add ${ct} rules..."
+    echo "${rules}" >> "${FW_RULES_LIST}"
+
+    # Set policy and ports for special rules
+    if [[ "${input_ports}"  == 'all' ]]; then
+        input_ports=''
+        input_policy=ACCEPT
+    elif [[ "${input_ports}"  == 'none' ]]; then
+        input_ports=''
+    fi
+    if [[ "${output_ports}" == 'all' ]]; then
+        output_ports=''
+        output_policy=ACCEPT
+    elif [[ "${output_ports}" == 'none' ]]; then
+        output_ports=''
+    fi
+
+    # Input
+    iptables -N "${ct}-input"
+    ${log} && iptables -A "${ct}-input" -j LOG --log-prefix "${ct}-in "
+    iptables_ports -A "${ct}-input" -d "${ctd}" --ports "${input_ports}" -j ACCEPT
+    iptables -A "${ct}-input" -d "${ctd}" -j "${input_policy}"
+    iptables -A ct-input -d "${ctd}" -m state --state NEW -j "${ct}-input"
+
+    # Output
+    iptables -N "${ct}-output"
+    ${log} && iptables -A "${ct}-output" -j LOG --log-prefix "${ct}-out "
+    iptables_ports -A "${ct}-output" -s "${ctd}" --ports "${output_ports}" -j ACCEPT
+    iptables -A "${ct}-output" -s "${ctd}" -j "${output_policy}"
+    iptables -A ct-output -s "${ctd}" -m state --state NEW -j "${ct}-output"
+
+    # Save
+    fw_save
+}
+
+# ht: del     NAME                  delete rules for host
+fw_del(){
+    # Add rules to list
+    local ct="$1"
+    local ctd="${ct}.${DOMAIN}"
+    sed -n "/ ${ct} /!p" -i "${FW_RULES_LIST}"
+
+    # delete chains & rules
+    echo "Delete ${ct} rules..."
+    iptables-save 2>/dev/null | grep -v "${ct}-" | iptables-restore
+
+    # Save
+    fw_save
+}
+
+# ht: show    [PATTERN]             view all chains & rules [matching pattern]
+fw_show(){
+    iptables -vL 2>/dev/null | awk -v RS='' -v ORS='\n\n' "/$*/" | column -t \
+      | sed -e '/^Chain/s/  */ /g' -e 's,^Chain,\nChain,g' | tail -n+2
+}
+
+# ht: test                          validate rules or reset
+fw_test(){
+    read -r -t 5 -p "Continue? [y/N]: " answer
+    if ! [[ ${answer} =~ ^(y|Y|o|O).* ]]; then
+        echo && fw_reset
+    fi
+}
+
+# ht: save    [FILE]                save fw rules [to file]
+fw_save(){
+    local file="${1:-/etc/iptables/rules.v4}"
+    echo "Save rules to ${file}..."
+    iptables-save > "${file}" 2>/dev/null
+}
+
+# ht: restore [FILE]                restore all fw saved rules [from file]
+fw_restore(){
+    local file="${1:-/etc/iptables/rules.v4}"
+    echo "Restore rules to ${file}..."
+    iptables-restore 2>/dev/null < "${file}"
+}
+
+# ht: zero    [CHAIN1 CHAIN2...]    reset chain data counter
+fw_zero(){
+    for chain in "$@"; do
+        iptables -Z "${chain}";
+    done
+}
+
+# ht: reset                         reset all fw rules and chains
+fw_reset(){
+    echo "Reset rules..."
+    iptables -P INPUT ACCEPT
+    iptables -P FORWARD ACCEPT
+    iptables -P OUTPUT ACCEPT
+    iptables -t filter -F
+    iptables -t nat -F
+    iptables -t mangle -F
+    iptables -t raw -F
+    iptables -F
+    iptables -X
+}
+
+# ht: help                          displays this help message
+fw_help() {
+    echo "Available commands:"
+    echo
+    sed -n '/^# ht: /{s/# ht: /  /;p}' "$0"
+    echo
+}
+
+# Root ?
+if [[ "${EUID}" != '0' ]]; then
+    die '1' "need root rights"
+fi
+
+case "$1" in
+    init|add|del|show|test|save|restore|zero|reset) "fw_$1" "${@:2}";;
+    *) fw_help "$2";;
+esac
+
