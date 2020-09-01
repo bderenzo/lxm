@@ -87,11 +87,11 @@ lxm_name_running_required() {
 }
 
 lxm_container_path() {
-    echo "${CT_PATH}/$1"
+    echo "$(lxc-config lxc.lxcpath)/$1"
 }
 
 lxm_config_path() {
-    echo "$(lxm_container_path "$1")/config"
+    echo "$(lxc-config lxc.lxcpath)/$1/config"
 }
 
 lxm_config_get() {
