@@ -315,8 +315,8 @@ lxm_build() {
     echo "Install ${ct}..."; hr
     for id in $(get_list '(cp|ks)'); do
         local at="$(get_attr "${id}")"
-        [[ ${id} =~ 'cp' ]] && lxm_push "${ct}" "$(ge "${at}" 1)" "$(ge "${at}" 2)"
-        [[ ${id} =~ 'ks' ]] && lxm_execfile "${ct}" "${at}"
+        [[ ${id} =~ ^cp ]] && lxm_push "${ct}" "$(ge "${at}" 1)" "$(ge "${at}" 2)"
+        [[ ${id} =~ ^ks ]] && lxm_execfile "${ct}" "${at}"
     done; hr
 
     # set firewall rules
@@ -497,7 +497,7 @@ lxm_exec() {
     lxc-attach -n "$1" -- "${@:2}"
 }
 
-# ht: execfile NAME FILE            run a script on the named running container (with sh)
+# ht: execfile NAME FILE            copy and run a script on the named container (with sh)
 lxm_execfile() {
     local ct="$1"
     local script="$2"
