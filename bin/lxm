@@ -114,7 +114,8 @@ lxm_config_cmt() {
 }
 
 lxm_cores_map_get() {
-    grep -H cpuset "${CT_PATH}/"*'/config' | sed -e "s,${CT_PATH}/,," -e 's,/config.* = ,=,g'
+    ctp="$(lxc-config lxc.lxcpath)"
+    grep -H cpuset "${ctp}/"*'/config' 2>/dev/null | sed -e "s,${ctp}/,," -e 's,/config.* = ,=,g'
 }
 
 lxm_cores_map() {
