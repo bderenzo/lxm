@@ -683,8 +683,9 @@ fi
 
 # Main
 case "$1" in
-    help|start|stop|restart|clone|attach|ls|lsi|cpumap|info|top|config|init|\
+    start|stop|restart|clone|attach|ls|lsi|cpumap|info|top|config|init|\
        build|backup|restore|rm|go|push|share|unshare|exec|execfile|update|version) "lxm_$1" "${@:2}";;
+    help|-h|--help) "lxm_help" "${@:2}";;
     *) shout "invalid command '$1'"; echo "Try 'lxm help' for more information."; exit 1;;
 esac
 
