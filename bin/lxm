@@ -238,7 +238,7 @@ lxm_init() {
     if [[ "$2" == '--bare' ]]; then
         lxm_build_bare "${ct}"
     else
-        lxc-create -t download -n "${ct}" -- -a "$(get_arch)" "${@:2}"
+        DOWNLOAD_KEYSERVER="keys.openpgp.org" lxc-create -t download -n "${ct}" -- -a "$(get_arch)" "${@:2}"
     fi
 }
 
@@ -263,9 +263,9 @@ lxm_build() {
     # + use lvm if enabled
     echo "Build ${ct}..."
     ${LVM_DISK} && lvm_opts="--bdev lvm --vgname ${LVM_VG} --thinpool ${LVM_POOL} --fstype ext4 --fssize $(get_attr disk)"
-    lxc-create -n "${ct}" -t download ${lvm_opts} -- -d "$(get_attr os)" -r "$(get_attr release)" -a "$(get_arch)" &>./build.log
+    DOWNLOAD_KEYSERVER="keys.openpgp.org" lxc-create -n "${ct}" -t download ${lvm_opts} -- -d "$(get_attr os)" -r "$(get_attr release)" -a "$(get_arch)" &>./build.log
     if [[ "$?" == '1' ]]; then
-        die 1 'failed, container already exist ? read build.log for more info.'
+        die 1 'failed, container already exist? read build.log for more info.'
     else
         rm build.log
     fi
@@ -276,6 +276,7 @@ lxm_build() {
         lxm_config set "${ct}" net-up-script   "${PORTS_FWD_SCRIPT}" "$(get_attr ports)"
         lxm_config set "${ct}" net-down-script "${PORTS_FWD_SCRIPT}"
     fi
+
     # mac address config
     local mac="${CT_MAC_BASE}$(hexdump -n3 -e '/1 ":%02X"' /dev/urandom)"
     lxm_config set "${ct}" mac-addr     "${mac}"

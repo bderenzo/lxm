@@ -4,7 +4,6 @@
 # Alpine
 #
 if [ -f /etc/alpine-release ]; then
-    apk update --no-cache
     apk upgrade --no-cache
     apk clean cache &>/dev/null
 #
