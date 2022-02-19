@@ -23,11 +23,11 @@ hr() { printf '~%.0s' $(seq ${COLUMNS}); }
 
 get_arch(){
     case "$(uname -m)" in
-        armv7l)  echo 'armhf';;
-        x86_64)  echo 'amd64';;
-        armv8)   echo 'arm64';;
-        i386)    echo 'i386';;
-        *)       echo 'amd64';;
+        armv7l)  	echo 'armhf';;
+        x86_64)  	echo 'amd64';;
+        armv8|aarch64)  echo 'arm64';;
+        i386)    	echo 'i386';;
+        *)       	echo 'amd64';;
     esac
 }
 
@@ -256,7 +256,7 @@ lxm_build() {
     local ct="$(get_attr hostname)"
     lxm_name_check "${ct}"
     if [[ "$2" == '-f' ]] && lxm_name_exist "${ct}"; then
-        lxm_rm "${ct}" -y
+        lxm_rm "${ct}" -y -f
     fi
 
     # create container
